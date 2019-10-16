@@ -30,6 +30,8 @@ typedef double(*PXPLMGetDatad)(XPLMDataRef);
 typedef void(*PXPLMSetDatad)(XPLMDataRef, double);
 typedef int(*PXPLMGetDatab)(XPLMDataRef, void*, int, int);
 typedef void(*PXPLMSetDatab)(XPLMDataRef, void*, int, int);
+typedef XPLMDataRef(*PXPLMRegisterDataAccessor)(const char*, XPLMDataTypeID, int, XPLMGetDatai_f, XPLMSetDatai_f, XPLMGetDataf_f, XPLMSetDataf_f, XPLMGetDatad_f, XPLMSetDatad_f, XPLMGetDatavi_f, XPLMSetDatavi_f, XPLMGetDatavf_f, XPLMSetDatavf_f, XPLMGetDatab_f, XPLMSetDatab_f, void*, void*);
+typedef void(*PXPLMUnregisterDataAccessor)(XPLMDataRef);
 
 // Commands - X-Plane API Function Pointer Types
 typedef XPLMCommandRef(*PXPLMFindCommand)(const char*);
@@ -85,6 +87,8 @@ static PXPluginDisable ClrPluginDisable;
 static PXPluginReceiveMessage ClrPluginReceiveMessage;
 
 static void* s_externalLoggingHandle = 0;
+static bool s_isEnabled = false;
+static bool s_isStarted = false;
 
 typedef struct {
 	// This type must be kept in sync with the version in C#.
@@ -116,7 +120,9 @@ typedef struct
 	PXPLMSetDatavf XPLMSetDatavf;
 	PXPLMGetDatab XPLMGetDatab;
 	PXPLMSetDatab XPLMSetDatab;
-
+	PXPLMRegisterDataAccessor XPLMRegisterDataAccessor;
+	PXPLMUnregisterDataAccessor XPLMUnregisterDataAccessor;
+	
 	// Commands
 	PXPLMFindCommand XPLMFindCommand;
 	PXPLMCommandBegin XPLMCommandBegin;
@@ -168,6 +174,16 @@ std::wstring GetPluginDirectory()
 	return fp.parent_path().generic_wstring();
 }
 
+XPNETPLUGIN_API bool XPNetPluginIsEnabled()
+{
+	return s_isEnabled;
+}
+
+XPNETPLUGIN_API bool XPNetPluginIsStarted()
+{
+	return s_isStarted;
+}
+
 // For testing: provide an alternate log target than the normal log file.
 XPNETPLUGIN_API void XPNetPluginSetExternalLoggingHandle(void* externalLoggingHandle)
 {
@@ -187,7 +203,7 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 
 		XPLMDebugString(("XPNet: X-Plane reports plugin dir as " + pluginDir.generic_string() + "\n").c_str());
 
-		fs::path dotnetProbePaths[] {
+		fs::path dotnetProbePaths[]{
 #           if defined(__APPLE__)
 			  pluginDir / "dotnet-macos",
 			  pluginDir.parent_path() / "dotnet-macos",
@@ -198,9 +214,9 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 			  pluginDir.parent_path() / "dotnet-windows",
 #           endif
 
-			// Fall back to the older name if no platform-specific folder found.
-			pluginDir / "dotnet",
-			pluginDir.parent_path() / "dotnet"
+			  // Fall back to the older name if no platform-specific folder found.
+			  pluginDir / "dotnet",
+			  pluginDir.parent_path() / "dotnet"
 		};
 
 		// Assuming that the pluginPath looks like <PluginDir>/32, we want to
@@ -250,7 +266,10 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 			XPLMDebugString("XPNet: Failed to load CLR.\n");
 			return 0;
 		}
+	}
 
+	if (!ClrPluginStart)
+	{
 		ClrPluginStart = GetClrMethod<PXPluginStart>(s_clrToken, L"XPNet.CLR", L"XPNet.PluginBridge", L"Start");
 		ClrPluginStop = GetClrMethod<PXPluginStop>(s_clrToken, L"XPNet.CLR", L"XPNet.PluginBridge", L"Stop");
 		ClrPluginEnable = GetClrMethod<PXPluginEnable>(s_clrToken, L"XPNet.CLR", L"XPNet.PluginBridge", L"Enable");
@@ -259,6 +278,10 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 
 		if (!ClrPluginStart || !ClrPluginStop || !ClrPluginEnable || !ClrPluginDisable || !ClrPluginReceiveMessage)
 		{
+			// ClrPluginStart is our sentinel for whether the callbacks were loaded, so make sure it's null'd out even if
+			// it happens not to be the one that failed to be found above.
+			ClrPluginStart = nullptr;
+
 			XPLMDebugString("XPNet: Failed to load one or more required methods from XPNet.PluginBridge in XPNet.CLR.  Cannot continue.\n");
 			return 0;
 		}
@@ -282,6 +305,8 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 		XPLMSetDatavf,
 		XPLMGetDatab,
 		XPLMSetDatab,
+		XPLMRegisterDataAccessor,
+		XPLMUnregisterDataAccessor,
 
 		// Commands
 		XPLMFindCommand,
@@ -330,8 +355,19 @@ XPNETPLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc)
 		strcp(outSig, sp.sig);
 		strcp(outDesc, sp.desc);
 	}
+	else
+	{
+		// Couldn't start the plugin, so don't leave a loaded-but-unused CLR around.
+		//
+		// MAINT: See notes in XPluginStop about this.
+		//
+		// UnloadClr(s_clrToken);
+		// s_clrToken = 0;
+	}
 
 	XPLMDebugString(("XPNet: ClrPluginStart Result = " + std::to_string(ret) + ".\n").c_str());
+
+	s_isStarted = ret != 0;
 
 	return ret;
 }
@@ -343,12 +379,16 @@ XPNETPLUGIN_API void XPluginStop(void)
 
 	ClrPluginStop();
 
-	// MAINT: .NET Core doesn't implement unloading yet, so don't even try.  It would
-	// return Success here but then fail when we try to load a new domain later.  Instead,
-	// we just make sure to clean up as best we can in our own C# code so that we're in
-	// as clean an environment as possible when we start it back up again later.
-	//UnloadClr(s_clrToken);
-	//s_clrToken = 0;
+	s_isStarted = false;
+
+	// .NET Core does not support unloading and reloading a CLR - so basically they don't
+	// _really_ support our use case.  Others have asked about it (e.g., for building plugins
+	// for games, just like we're doing here) on the github issues page, so far to deaf ears.
+	// But to a first approximation we can get the behavior we want just by never unloading
+	// the CLR - it'll still be loaded and ready to go if XPluginStart is called again.
+	//
+	// UnloadClr(s_clrToken);
+	// s_clrToken = 0;
 }
 
 XPNETPLUGIN_API int XPluginEnable(void)
@@ -356,7 +396,9 @@ XPNETPLUGIN_API int XPluginEnable(void)
 	if (!s_clrToken)
 		return 0;
 
-	return ClrPluginEnable();
+	int ret = ClrPluginEnable();
+	s_isEnabled = ret != 0;
+	return ret;
 }
 
 XPNETPLUGIN_API void XPluginDisable(void)
@@ -365,6 +407,8 @@ XPNETPLUGIN_API void XPluginDisable(void)
 		return;
 
 	ClrPluginDisable();
+
+	s_isEnabled = false;
 }
 
 XPNETPLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, int inMsg, void * inParam)
